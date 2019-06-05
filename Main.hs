@@ -5,6 +5,7 @@ TODO
 
 module Main where
 
+import           Data.Foldable(traverse_)
 import           Control.Concurrent
 import           Control.Concurrent.MVar
 import qualified Data.ByteString.Lazy.Char8         as BSLC
@@ -15,7 +16,7 @@ import           System.Console.GetOpt
 import           System.Console.ANSI
 import           System.Environment
 
-{- globals -}
+{- use a readerT for these -}
 filename    = "mdf-kospi200.20110216-0.pcap" -- PCAP file
 sortDelay   = 300::Int                       -- quote/packet accept time threshold, in hundredths of a second
 key         = "B6034"                        -- target  Data Type + Information Type + Market Type
@@ -30,17 +31,38 @@ main = do
     putStrLn $ "unrecognized options" ++ show unrecOpts
     putStrLn $ "errs" ++ show errs
     --if Ticker `elem` optArgs then clearScreen else return ()
-    if Help `elem` optArgs then help
-    else case errs of -- Drop 24-byte global pcap header. 
-            [] -> listen
+    -- make sure buffer arg is > 0. 
+
+    -- create thread for skip channel
+    newSkchan <- newEmptyMVar 
+    let skchan = Just newSkchan
+    tid <- if Skip `elem` optArgs then do
+                newTid <- forkIO $ skipScanner newSkchan (Ticker `elem` optArgs)
+                return $ Just newTid
+           else return Nothing   
+
+    case errs of
+        [] -> do
+            if Help `elem` optArgs then help
+            else do
+                listen
                     (Reorder `elem` optArgs)
                     (Ticker `elem` optArgs)
-                    (Skip `elem` optArgs)
-                    (Buffer `elem` optArgs)
+                    ((Buffer 0) `elem` optArgs)
                     (Just $ (read (nonOpts!!0)::Int))  -- if buffer true
-                             =<< ((BSLC.drop 24) <$> (BSLC.readFile filename))
-            _ -> help
-    if Ticker `elem` optArgs then putStr "\n" else return () -- ticker format leaves the cursor at end of line
+                    skchan
+                         =<< ((BSLC.drop 24) <$> (BSLC.readFile filename))
+                if Ticker `elem` optArgs then putStr "\n" else return () -- ticker format leaves the cursor at end of line
+        es -> do
+            putStrLn "Option error(s):"
+            traverse_ (\e -> putStrLn $ "    " ++ e) es
+
+    -- kill skip channel thread
+    putStrLn "killing skip channel"
+    if Skip `elem` optArgs then
+        case tid of Nothing -> return ()
+                    Just id -> killThread id
+    else return ()
 
 --
 parseArgs :: IO ([Flag], [String], [String], [String])
@@ -50,25 +72,26 @@ parseArgs = do
 
 -- show help
 help :: IO ()
-help = putStrLn $ usageInfo "Usage:\n" options
+help = putStrLn $ usageInfo "\nUsage:\n" options
 
 {- -}
-data Flag = Buffer | Help | Skip | Reorder | Ticker | BufferSize String deriving (Eq,Ord,Show)
+data Flag = Help | Skip | Reorder | Ticker | Buffer Int deriving (Show, Eq)  -- Ord
 
 {--}
 options :: [OptDescr Flag]
 options = [
-    Option ['h'] ["help"]         (NoArg Help)      "Show help."
+     Option ['h'] ["help"]         (NoArg Help)      "Show help."
     ,Option ['r'] ["reorder"]      (NoArg Reorder)   "Reorder quotes by quote accept time."
-    ,Option ['t'] ["ticker"]       (NoArg Ticker)    "Quotes display on one line instead of printing multiple lines."
+    ,Option ['t'] ["ticker"]       (NoArg Ticker)    "Quotes display on one line, overwriting the previous quote."
     ,Option ['s'] ["skip-channel"] (NoArg Skip)      "Use a skip channel. Skips quotes in order to eliminate lag when printing."
-    ,Option ['b'] ["buffer"]       (NoArg Buffer)    "Use a buffer to collect quotes before printing them. Useful if stream is intermittent and you want to minimize dropped data."
-    ,Option ['z'] ["buffer-size"]  (ReqArg BufferSize "BUFSIZE")  "Number of quotes to store in buffer."
+    ,Option ['b'] ["buffer"]       
+        (ReqArg (\s -> (Buffer (read s::Int))) "BUFSIZE" )
+        "Not recommended. Buffer n quotes before printing. Useful if stream is intermittent and you want to minimize dropped data."
     ]
 
 -- read pcap file
-listen :: Bool -> Bool -> Bool -> Bool -> Maybe Int -> BSLC.ByteString -> IO ()
-listen r t s b z bs =
+listen :: Bool -> Bool -> Bool -> Maybe Int -> Maybe (MVar Quote) -> BSLC.ByteString -> IO ()
+listen r t b z skchan bs =
     if not (BSLC.null bs) then do
         -- extract PCAP header
         let (pcapHeader, rest)              = BSLC.splitAt 16 bs
@@ -88,28 +111,32 @@ listen r t s b z bs =
             let (packetQuote,   rest4)      = BSLC.splitAt 210 rest3
             if BSLC.unpack keyVal == key
             then do
-                dispatch r t s b z $ packetToQuote packetTime packetQuote
-                listen r t s b z rest4
-            else listen r t s b z $ BSLC.drop pcapLength rest -- rest used twice !!!!!!!!!1
-        else listen r t s b z $ BSLC.drop pcapLength rest -- skip packet
+                dispatch r t b z skchan $ packetToQuote packetTime packetQuote
+                listen r t b z skchan rest4
+            else listen r t b z skchan $ BSLC.drop pcapLength rest -- rest used twice !!!!!!!!!1
+        else listen r t b z skchan $ BSLC.drop pcapLength rest -- skip packet
     else return ()
 
 -- dispatch the quote to a buffer, channel, stdio, etc
-dispatch :: Bool -> Bool -> Bool -> Bool -> Maybe Int -> Quote -> IO ()
--- dispatch :: Heap.MinHeap Quote -> Maybe Int -> IO (Heap.MinHeap Quote)
--- dispatch quoteBuffer newAcceptTime = case newAcceptTime of
-dispatch r t s b z quote = do
-    if t then do
-        --clearFromCursorToLineBeginning
-        --clearLine
-        --cursorUpLine 1    -- puts cursor at top of screen
-        --setCursorPosition 10 0  -- works as expected
-        setCursorColumn 0
-        putStr $ show quote
-    else putStrLn $ show quote
-  
+-- order is:  skip channel --> buffer -> reorder queue
+dispatch :: Bool -> Bool -> Bool -> Maybe Int -> Maybe (MVar Quote) -> Quote -> IO ()
+dispatch r t b z skchan quote = do
+    case skchan of
+        Just sc -> do
+            success <- tryPutMVar sc quote
+            return ()
+        otherwise -> printQuote t quote
+
+--
+skipScanner :: MVar Quote -> Bool -> IO ()
+skipScanner skchan t = do
+    q <- takeMVar skchan
+    printQuote t q
+    skipScanner skchan t
 
 {- printRecursive
+-- dispatch :: Heap.MinHeap Quote -> Maybe Int -> IO (Heap.MinHeap Quote)
+-- dispatch quoteBuffer newAcceptTime = case newAcceptTime of
     | not $ BSLC.null bs = do  -- Data is arriving from stream
     | not $ Heap.isEmpty quoteBuffer = printQuoteBuffer quoteBuffer Nothing
          >>= listenReordered bs                                         -- stream ended, but buffer not empty
@@ -161,8 +188,11 @@ packetToQuote packetTime bs = Quote packetTime issueCode b1 b2 b3 b4 b5 a1 a2 a3
        acceptTime = read (items!!24)::Int
 
 {- Prints a Quote. -}
-printQuote :: Quote -> IO ()
-printQuote quote = putStrLn $ show quote
+printQuote :: Bool -> Quote -> IO ()
+printQuote ticker quote = if ticker then do
+                            setCursorColumn 0
+                            putStr $ show quote
+                          else putStrLn $ show quote
 
 {- Break a byte string up into arbitrarily sized substrings. -}
 split :: BSLC.ByteString -> [Int64] -> [BSLC.ByteString]
