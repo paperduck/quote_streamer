@@ -1,6 +1,10 @@
 {-
 TODO
     haddock comments
+    readerT for args
+    rest of options
+    make sure buffer size positive
+    rest used twice
 -}
 
 module Main where
@@ -11,58 +15,93 @@ import           Control.Concurrent.MVar
 import qualified Data.ByteString.Lazy.Char8         as BSLC
 import qualified Data.Heap                          as Heap
 import           Data.Int (Int64)
+--import           Data.Map.Strict (Map, fromList, lookup)
 import           Network.Transport.Internal (decodeNum16, decodeNum32)
 import           System.Console.GetOpt
 import           System.Console.ANSI
 import           System.Environment
+import           Control.Monad.Reader
 
-{- use a readerT for these -}
-filename    = "mdf-kospi200.20110216-0.pcap" -- PCAP file
-sortDelay   = 300::Int                       -- quote/packet accept time threshold, in hundredths of a second
-key         = "B6034"                        -- target  Data Type + Information Type + Market Type
-ports       = [15515, 15516]
+-- static global config
+data Config = Config {
+    filename :: String
+    ,sortDelay :: Int
+    ,key :: String
+    ,ports :: [Int]
+    ,reorder :: Bool
+    ,ticker :: Bool
+    ,buffer :: Bool
+    ,bufsize :: Int
+    ,maybeSkipchannel :: Maybe (MVar Quote)
+}
 
 {- main -}
 main :: IO ()
 main = do
+    -- debugging
     (optArgs, nonOpts, unrecOpts, errs) <- parseArgs
     putStrLn $ "option args: " ++ show optArgs
     putStrLn $ "non options: " ++ show nonOpts
     putStrLn $ "unrecognized options" ++ show unrecOpts
     putStrLn $ "errs" ++ show errs
-    --if Ticker `elem` optArgs then clearScreen else return ()
-    -- make sure buffer arg is > 0. 
 
-    -- create thread for skip channel
-    newSkchan <- newEmptyMVar 
-    let skchan = Just newSkchan
-    tid <- if Skip `elem` optArgs then do
-                newTid <- forkIO $ skipScanner newSkchan (Ticker `elem` optArgs)
-                return $ Just newTid
-           else return Nothing   
+    -- create skip channel
+    skipchan <- newEmptyMVar 
 
-    case errs of
-        [] -> do
-            if Help `elem` optArgs then help
-            else do
-                listen
-                    (Reorder `elem` optArgs)
-                    (Ticker `elem` optArgs)
-                    ((Buffer 0) `elem` optArgs)
-                    (Just $ (read (nonOpts!!0)::Int))  -- if buffer true
-                    skchan
-                         =<< ((BSLC.drop 24) <$> (BSLC.readFile filename))
-                if Ticker `elem` optArgs then putStr "\n" else return () -- ticker format leaves the cursor at end of line
-        es -> do
-            putStrLn "Option error(s):"
-            traverse_ (\e -> putStrLn $ "    " ++ e) es
+    -- show help if needed
+    if (Help `elem` optArgs) then help
+    else do
 
-    -- kill skip channel thread
-    putStrLn "killing skip channel"
-    if Skip `elem` optArgs then
-        case tid of Nothing -> return ()
-                    Just id -> killThread id
-    else return ()
+        -- initialize config
+        let config = Config {
+            filename="mdf-kospi200.20110216-0.pcap" -- PCAP file
+            ,sortDelay=300                          -- quote/packet accept time threshold, in hundredths of a second
+            ,key="B6034"                            -- target  Data Type + Information Type + Market Type
+            ,ports=[15515, 15516]
+            ,reorder=(Reorder `elem` optArgs)
+            ,ticker=(Ticker `elem` optArgs)
+            ,buffer=(hasBuffer optArgs)
+            ,bufsize=if length nonOpts > 0 then read (nonOpts!!0)::Int else 0
+            ,maybeSkipchannel=if Skip `elem` optArgs then Just skipchan else Nothing
+        }
+        
+        -- fork a thread
+        tid <-  myThreadId  -- dirty trick to create tid in scope!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        case maybeSkipchannel config of
+            Just skchan -> do
+                tid <- forkIO $ skipScanner skchan (ticker config)  -- fork thread
+
+                -- run main if no errors
+                case errs of
+                    [] -> do
+                        stream <- ((BSLC.drop 24) <$> (BSLC.readFile $ filename config))
+                        runReaderT (listen stream) config
+                        if ticker config then putStr "\n" else return () -- ticker format leaves the cursor at end of line
+                    es -> do
+                        putStrLn "Option error(s):"
+                        traverse_ (\e -> putStrLn $ "    " ++ e) es
+
+                -- kill skip channel thread
+                putStrLn "killing skip channel"
+                killThread tid
+
+            Nothing -> do
+
+                -- run main if no errors
+                case errs of
+                    [] -> do
+                        stream <- ((BSLC.drop 24) <$> (BSLC.readFile $ filename config))
+                        runReaderT (listen stream) config
+                        if ticker config then putStr "\n" else return () -- ticker format leaves the cursor at end of line
+                    es -> do
+                        putStrLn "Option error(s):"
+                        traverse_ (\e -> putStrLn $ "    " ++ e) es
+
+-- workaround !!!!!!!!!!
+hasBuffer :: [Flag] -> Bool
+hasBuffer []     = False
+hasBuffer (x:xs) = case x of Buffer _ -> True
+                             _ -> hasBuffer xs
 
 --
 parseArgs :: IO ([Flag], [String], [String], [String])
@@ -90,9 +129,10 @@ options = [
     ]
 
 -- read pcap file
-listen :: Bool -> Bool -> Bool -> Maybe Int -> Maybe (MVar Quote) -> BSLC.ByteString -> IO ()
-listen r t b z skchan bs =
+listen :: BSLC.ByteString -> ReaderT Config IO ()
+listen bs = 
     if not (BSLC.null bs) then do
+        cfg <- ask
         -- extract PCAP header
         let (pcapHeader, rest)              = BSLC.splitAt 16 bs
         let (bsPacketTimeSec,  pcapRest1)   = BSLC.splitAt 4 pcapHeader                -- packet time, sec
@@ -109,30 +149,31 @@ listen r t b z skchan bs =
         if intDestPort `elem` [15515, 15516] then do
             let (keyVal,        rest3)      = BSLC.splitAt 5 $ BSLC.drop 4 rest2
             let (packetQuote,   rest4)      = BSLC.splitAt 210 rest3
-            if BSLC.unpack keyVal == key
+            if BSLC.unpack keyVal == key cfg
             then do
-                dispatch r t b z skchan $ packetToQuote packetTime packetQuote
-                listen r t b z skchan rest4
-            else listen r t b z skchan $ BSLC.drop pcapLength rest -- rest used twice !!!!!!!!!1
-        else listen r t b z skchan $ BSLC.drop pcapLength rest -- skip packet
-    else return ()
+                dispatch $ packetToQuote packetTime packetQuote
+                listen rest4
+            else listen $ BSLC.drop pcapLength rest -- rest used twice !!!!!!!!!1
+        else listen $ BSLC.drop pcapLength rest -- skip packet
+    else liftIO $ return ()
 
 -- dispatch the quote to a buffer, channel, stdio, etc
 -- order is:  skip channel --> buffer -> reorder queue
-dispatch :: Bool -> Bool -> Bool -> Maybe Int -> Maybe (MVar Quote) -> Quote -> IO ()
-dispatch r t b z skchan quote = do
-    case skchan of
+dispatch :: Quote -> ReaderT Config IO ()
+dispatch quote = do
+    cfg <- ask
+    case maybeSkipchannel cfg of
         Just sc -> do
-            success <- tryPutMVar sc quote
-            return ()
-        otherwise -> printQuote t quote
+            success <- liftIO $ tryPutMVar sc quote
+            liftIO $ return ()
+        otherwise -> liftIO $ printQuote quote (ticker cfg)
 
 --
 skipScanner :: MVar Quote -> Bool -> IO ()
-skipScanner skchan t = do
+skipScanner skchan bTicker = do
     q <- takeMVar skchan
-    printQuote t q
-    skipScanner skchan t
+    printQuote q bTicker
+    skipScanner skchan bTicker
 
 {- printRecursive
 -- dispatch :: Heap.MinHeap Quote -> Maybe Int -> IO (Heap.MinHeap Quote)
@@ -188,11 +229,13 @@ packetToQuote packetTime bs = Quote packetTime issueCode b1 b2 b3 b4 b5 a1 a2 a3
        acceptTime = read (items!!24)::Int
 
 {- Prints a Quote. -}
-printQuote :: Bool -> Quote -> IO ()
-printQuote ticker quote = if ticker then do
-                            setCursorColumn 0
-                            putStr $ show quote
-                          else putStrLn $ show quote
+printQuote :: Quote -> Bool -> IO ()
+printQuote quote bTicker = do
+    if bTicker then do
+        setCursorColumn 0
+        putStr $ show quote
+    else
+        putStrLn $ show quote
 
 {- Break a byte string up into arbitrarily sized substrings. -}
 split :: BSLC.ByteString -> [Int64] -> [BSLC.ByteString]
