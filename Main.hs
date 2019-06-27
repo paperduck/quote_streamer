@@ -1,3 +1,7 @@
+--{-# OPTIONS_GHC -Wall #-}
+--{-# OPTIONS_GHC -Werror #-}
+--{-# OPTIONS_GHC -fno-omit-yields #-}
+
 {-
 TODO
     haddock comments
@@ -13,6 +17,10 @@ TODO
     test cases
     verbose output
     ReaderT is mainly used to demonstrate ability. Can't use in forked thread?
+-}
+
+{- README
+    -- quote pipeline:  stream  -> drawer -> buffer -> reorder queue -> printer
 -}
 
 module Main where
@@ -37,23 +45,24 @@ import qualified MyQueue as Q
 --instance Exception EndOfStreamException
 
 data Config = Config {
-     filename           :: String
-    ,verbose            :: Bool
-    ,sortDelay          :: Int
-    ,key                :: String
-    ,ports              :: [Int]
-    ,reorder            :: Bool
-    ,ticker             :: Bool
-    ,skip               :: Bool         -- skip or wait
-    ,drawer             :: MVar Quote   -- transaction drawer
-    ,buffer             :: Bool
-    ,bufsize            :: Int
+     filename           :: !String
+    ,verbose            :: !Bool
+    ,sortDelay          :: !Int
+    ,key                :: !String
+    ,ports              :: ![Int]
+    ,reorder            :: !Bool
+    ,ticker             :: !Bool
+    ,skip               :: !Bool         -- skip or wait
+    ,drawer             :: MVar (Maybe Quote)   -- transaction drawer; Nothing = stream ends
+    ,buffer             :: !Bool
+    ,bufsize            :: !Int
     ,endOfStream        :: MVar Bool
     ,finishedPrinting   :: MVar Bool
 }
 
 --
 getBufferSize :: [Flag] -> Maybe Int
+{-# INLINE getBufferSize #-}
 getBufferSize flags = case sizes of
     x:_ -> Just $ abs x
     [] -> Nothing
@@ -65,12 +74,12 @@ main = do
     (optArgs, nonOpts, unrecOpts, errs) <- parseArgs
 
     -- show help if needed
-    if (Help `elem` optArgs) then help
+    if (Help `elem` optArgs) then showHelp
     else do
         -- create skip channel
         emptyDrawer                 <- newEmptyMVar 
-        endOfStreamSemaphore        <- newEmptyMVar
         finishedPrintingSemaphore   <- newEmptyMVar
+        endOfStreamSemaphore        <- newEmptyMVar
         let bufferSize = getBufferSize optArgs
         --putStrLn $ "bufzise = " ++ (show bufferSize)
         let config = Config {
@@ -92,11 +101,11 @@ main = do
             ,endOfStream=endOfStreamSemaphore
             ,finishedPrinting=finishedPrintingSemaphore
         }
-        logMsg config $ "option args: " ++ show optArgs
-        logMsg config $ "non options: " ++ show nonOpts
-        logMsg config $ "unrecognized options" ++ show unrecOpts
-        logMsg config $ "errs" ++ show errs
-        logMsg config ""
+        runReaderT (logMsg $ "option args: " ++ show optArgs) config
+        runReaderT (logMsg $ "non options: " ++ show nonOpts) config
+        runReaderT (logMsg $ "unrecognized options" ++ show unrecOpts) config
+        runReaderT (logMsg $ "errs" ++ show errs) config
+        runReaderT (logMsg "") config
 
         -- Buffer pointless when not multithreaded
         let errs' = errs ++ if not (skip config) && buffer config
@@ -105,54 +114,46 @@ main = do
 
         case errs' of
             [] -> do
-                {-  Listener loops to read. Forked fun loops for takeMVar. Reorder buffer needs to be in either one.
-
-                    ticker      -> N/A; inside printQuote
-                    skip        -> always MVar+thread
-                    buffer      -> MVar+thread if skip, otherwise reorder or print in same threaad
-                    reorder     -> N/A
-                -}
                 stream <- ((BSLC.drop 24) <$> (BSLC.readFile $ filename config)) -- open pcap file
                 if skip config then do
                     -- Launch a printer thread before the stream starts
                     if buffer config then
-                        if reorder config then forkIO $ printerBufferReorder config Q.empty Heap.empty
-                        else                   forkIO $ printerBuffer        config Q.empty
+                        if reorder config then forkIO $ runReaderT (printerBufferReorder Q.empty Heap.empty) config
+                        else                   forkIO $ runReaderT (printerBuffer        Q.empty)            config
                     else
-                        if reorder config then forkIO $ printerReorder       config Heap.empty
-                        else                   forkIO $ printer              config
-                    listenThreaded config stream
+                        if reorder config then forkIO $ runReaderT (printerReorder               Heap.empty) config
+                        else                   forkIO $ runReaderT (printer                                ) config
+                    runReaderT (listenThreaded stream) config
                 else
-                    if reorder config then listenReorder       config stream Heap.empty
-                    else                   listen              config stream 
-                -- ticker format leaves the cursor at end of line
-                if ticker config then putStr "\n" else return ()
+                    if reorder config then runReaderT (listenReorder stream Heap.empty) config
+                    else                   runReaderT (listen        stream)            config
                 if skip config then do
-                    logMsg config "signalling end of stream"
-                    putMVar (endOfStream config) True      -- flush printer thread
-                    logMsg config "waiting for printer thread to finish"
+                    runReaderT (logMsg "\nsignalling end of stream") config
+                    putMVar (drawer config) Nothing      -- signal to flush printer thread
+                    runReaderT (logMsg "waiting for printer thread to finish") config 
                     finished <- takeMVar $ finishedPrinting config  -- wait for the printer thread to flush
-                    logMsg config "printer appears to have  finished"
+                    runReaderT (logMsg "printer appears to have  finished") config
                 else return ()
+                if ticker config then putStr "\n" else return ()  -- ticker leaves cursor at end of line
             es -> do
-                logMsg config "Option error(s):"
+                runReaderT (logMsg "Option error(s):") config
                 traverse_ (\e -> putStrLn $ "    " ++ e) es
 
---
-parseArgs :: IO ([Flag], [String], [String], [String])
 parseArgs = do
     cliArgs <- getArgs
     return $ getOpt' Permute options cliArgs
 
 -- show help
-help :: IO ()
-help = putStrLn $ usageInfo "\nUsage:\n" options
+showHelp :: IO ()
+{-# INLINE showHelp #-}
+showHelp = putStrLn $ usageInfo "\nUsage:\n" options
 
 {- -}
 data Flag = Verbose | Help | Skip | Reorder | Ticker | Buffer Int deriving (Show, Eq)  -- Ord
 
 {--}
 options :: [OptDescr Flag]
+{-# INLINE options #-}
 options = [ 
      Option ['v'] ["verbose"]      (NoArg Verbose)  "Verbose output."
     ,Option ['h'] ["help"]         (NoArg Help)      "Show help."
@@ -165,155 +166,164 @@ options = [
     ]
 
 -- no skip, no queue, no reorder
-listen :: Config -> BSLC.ByteString -> IO ()
-listen cfg stream = do
-    --putStrLn "listen"
-    let mNewQuote = nextQuote cfg stream
-    case mNewQuote of
+listen :: BSLC.ByteString -> ReaderT Config IO ()
+listen stream = do
+    --liftIO $ putStrLn "listen"
+    cfg <- ask
+    case nextQuote (key cfg) stream of
         Just (newQuote, streamRest) -> do
-            printQuote cfg newQuote
-            listen cfg streamRest
+            printQuote newQuote
+            listen streamRest
         Nothing -> return ()  -- end of stream
 
 --
-listenReorder :: Config -> BSLC.ByteString -> Heap.MinHeap Quote -> IO ()
-listenReorder cfg stream reorderBuffer = do
-    --putStrLn "listenReorder"
-    let mNewQuote = nextQuote cfg stream
-    case mNewQuote of
+listenReorder :: BSLC.ByteString -> Heap.MinHeap Quote -> ReaderT Config IO ()
+listenReorder stream reorderBuffer = do
+    --liftIO $ putStrLn "listenReorder"
+    cfg <- ask
+    case nextQuote (key cfg) stream of
         Just (newQuote, streamRest) -> do
-            poppedReorderBuffer <- printOlderThan cfg reorderBuffer (acceptTime newQuote)
-            listenReorder cfg streamRest (Heap.insert newQuote poppedReorderBuffer)
-        Nothing -> flushReordered cfg reorderBuffer  -- end of stream
+            poppedReorderBuffer <- printOlderThan reorderBuffer (acceptTime newQuote)
+            listenReorder streamRest (Heap.insert newQuote poppedReorderBuffer)
+        Nothing -> flushReordered reorderBuffer  -- end of stream
 
 --
-listenThreaded :: Config -> BSLC.ByteString -> IO ()
-listenThreaded cfg stream = do
-    --putStrLn "listenThreaded"
-    let mNewQuote = nextQuote cfg stream
-    case mNewQuote of
+listenThreaded :: BSLC.ByteString -> ReaderT Config IO ()
+listenThreaded stream = do
+    --liftIO $ putStrLn "listenThreaded"
+    cfg <- ask
+    case nextQuote (key cfg) stream of
         Just (newQuote, streamRest) -> do
-            success <- tryPutMVar (drawer cfg) newQuote
-            listenThreaded cfg streamRest
+            _ <- liftIO $ tryPutMVar (drawer cfg) (Just newQuote)
+            listenThreaded streamRest
         Nothing -> return ()  -- end of stream
 
 -- monitor transaction drawer for new quotes and process them.
--- Because MVars are so slow, this should only be used with a skip channel.
--- quote flow:  stream  -> [drawer] -> [buffer] -> [reorder queue] -> printer
--- signal flushed mvar in config on exit
-printer :: Config -> IO ()
-printer cfg = do
-    --putStrLn "printer"
-    mStreamEnded <- tryTakeMVar $ endOfStream cfg
-    case mStreamEnded of
-        Just True -> do
-            logMsg cfg "stream appears to have ended"
-            putMVar (finishedPrinting cfg) True
-        _ -> do  -- Nothing or Just False
-            mNewQuote <- tryTakeMVar $ drawer cfg
-            case mNewQuote of
-                Nothing -> printer cfg  -- no new quote; loop
-                Just newQuote -> do
-                    printQuote cfg newQuote  -- no queue, unordered - print immediately
-                    printer cfg
+-- Because MVars are so slow, this should only be used in conjunction with a skip channel
+printer :: ReaderT Config IO ()
+printer = do
+    --liftIO $ putStrLn "printer"
+    cfg <- ask
+    mNewQuote <- liftIO . takeMVar $ drawer cfg
+    case mNewQuote of
+        Nothing -> do
+            logMsg "\nstream appears to have ended"
+            liftIO $ putMVar (finishedPrinting cfg) True
+        Just newQuote -> printQuote newQuote >> printer
 
--- remember to flush when stream ends
-printerBuffer :: Config -> Q.MyQueue Quote -> IO ()
-printerBuffer cfg queue = do
-    --putStrLn "printerBuffer"
-    mStreamEnded <- tryTakeMVar $ endOfStream cfg
-    case mStreamEnded of
-        Just True -> do
-            logMsg cfg "stream appears to have ended."
-            flushBuffer cfg queue
-            putMVar (finishedPrinting cfg) True
-        _ -> do  -- Nothing or Just False
-            mNewQuote <- tryTakeMVar $ drawer cfg
-            case mNewQuote of
-                Just newQuote -> do
-                    logMsg cfg $ "queue size = " ++ (show $ Q.size queue)
-                    if Q.size queue == bufsize cfg then do  -- queue full, so skip new quote
-                        let (poppedQueue, mQuote) = Q.pop queue
-                        case mQuote of
-                            Just quote -> do
-                                printQuote cfg quote
-                                printerBuffer cfg poppedQueue
-                            Nothing -> error "full queue has no items"
-                    else
-                        if Q.size queue < bufsize cfg then printerBuffer cfg (Q.push newQuote queue)  -- quickly add to queue without printing anything
-                        else error "queue exceeded limit"  -- In production this should pop+print from the buffer
-                Nothing -> do  -- no new quote, so pop one from buffer
-                    let (poppedQueue, mQuote) = Q.pop queue
-                    case mQuote of
-                        Nothing -> printerBuffer cfg queue  -- nothing in queue
-                        Just quote -> do
-                            printQuote cfg quote
-                            printerBuffer cfg poppedQueue
+-- tryTake  
+--          -> Just mNewQ   
+--                        (1)  -> Just newQ     -> buffer is  full  -> print 1 from buffer  -> recurse
+--                                              -> buffer not full  -> push to buffer -> recurse
+--                        (2)  -> Just Nothing  -> end of stream
+--          -> Nothing      
+--                          -> buffer empty     -> take (block) 
+--                                                              -> (1)
+--                                                              -> (2)
+--                          -> buffer not empty -> print 1 from buffer  -> recurse
+printerBuffer :: Q.MyQueue Quote -> ReaderT Config IO ()
+printerBuffer queue = do
+    --liftIO $ putStrLn "printerBuffer"
+    cfg <- ask
+    --logMsg $ "queue size = " ++ (show $ Q.size queue)
+    mmNewQuote <- liftIO . tryTakeMVar $ drawer cfg
+    case mmNewQuote of
+        Just mNewQuote -> handleMNewQuote mNewQuote
+        Nothing -> do 
+            -- No new quote, so use this opportunity to pop the buffer
+            let (poppedQueue, mQuote) = Q.pop queue
+            case mQuote of
+                -- buffer is empty, so we can block
+                Nothing -> do
+                    mNewQuote <- liftIO . takeMVar $ drawer cfg
+                    handleMNewQuote mNewQuote  
+                -- pop from buffer
+                Just quote -> printQuote quote >> printerBuffer poppedQueue
+        where
+            handleMNewQuote mNewQuote = do
+                cfg <- ask
+                case mNewQuote of
+                    Just newQuote -> if Q.size queue >= bufsize cfg
+                         -- queue full; skip new quote
+                        then do 
+                            let (poppedQueue, mQuote) = Q.pop queue
+                            case mQuote of
+                                Just quote -> do
+                                    printQuote quote
+                                    printerBuffer poppedQueue
+                                Nothing -> error "full queue has no items"
 
---
-printerReorder :: Config -> Heap.MinHeap Quote -> IO ()
-printerReorder cfg reorderBuffer = do
-    --putStrLn "printerReorder"
-    mStreamEnded <- tryTakeMVar $ endOfStream cfg
-    case mStreamEnded of
-        Just True -> do
-            logMsg cfg "stream appears to have ended."
-            flushReordered cfg reorderBuffer
-            putMVar (finishedPrinting cfg) True
-        _ -> do  -- Nothing or Just False
-            -- print any quotes that are old enough
-            mNewQuote <- tryTakeMVar $ drawer cfg
-            case mNewQuote of
-                Just newQuote -> do
-                    newReorderBuffer <- printOlderThan cfg reorderBuffer (acceptTime newQuote)
-                    printerReorder cfg (Heap.insert newQuote newReorderBuffer)
-                Nothing -> printerReorder cfg reorderBuffer
+                        else printerBuffer (Q.push newQuote queue)  -- quickly add to queue without printing anything
+                    Nothing -> do  -- end of stream
+                        logMsg "stream appears to have ended."
+                        flushBuffer queue
+                        liftIO $ putMVar (finishedPrinting cfg) True  -- !!!! prevent deadlock?
 
 --
-printerBufferReorder :: Config -> Q.MyQueue Quote -> Heap.MinHeap Quote -> IO ()
-printerBufferReorder cfg queue reorderBuffer = do
-    --putStrLn "printerBufferReorder"
-    mStreamEnded <- tryTakeMVar $ endOfStream cfg
-    case mStreamEnded of
-        Just True -> do
-            logMsg cfg "stream appears to have ended."
-            if Q.size queue > 0 then do  -- move all from queue into reorderBuffer before flushing
-                logMsg cfg "transferring queue"
-                finalReorderedBuffer <- transferBuffer cfg queue reorderBuffer
-                flushReordered cfg finalReorderedBuffer
-            else do
-                flushReordered cfg reorderBuffer
-            putMVar (finishedPrinting cfg) True
-        _ -> do  -- Nothing or Just False
-            mNewQuote <- tryTakeMVar $ drawer cfg
-            case mNewQuote of
-                Just newQuote -> do
-                    logMsg cfg $ "queue size = " ++ (show $ Q.size queue)
-                    if Q.size queue == bufsize cfg then do  -- queue full, so skip new quote
-                        let (poppedQueue, mQuote) = Q.pop queue
-                        case mQuote of
-                            Just quote -> do  -- insert popped quote into reorder buffer
-                                newReorderBuffer <- printOlderThan cfg reorderBuffer (acceptTime quote)
-                                printerBufferReorder cfg poppedQueue newReorderBuffer
-                            Nothing -> error "full queue has no items"
-                    else
-                        -- quickly add to queue without printing anything
-                        if Q.size queue < bufsize cfg then printerBufferReorder cfg (Q.push newQuote queue) reorderBuffer  
-                        -- In production this should pop+print from the buffer to drop down to size limit
-                        else error "queue exceeded limit"  
-                Nothing -> do  -- no new quote, so pop one from buffer
-                    let (poppedQueue, mQuote) = Q.pop queue
-                    case mQuote of
-                        Just quote -> do  -- insert popped quote into reorder buffer
-                            newReorderBuffer <- printOlderThan cfg reorderBuffer (acceptTime quote)
-                            printerBufferReorder cfg poppedQueue (Heap.insert quote newReorderBuffer)
-                        -- no new quote, nothing in queue
-                        Nothing -> printerBufferReorder cfg queue reorderBuffer  
+printerReorder :: Heap.MinHeap Quote -> ReaderT Config IO ()
+printerReorder reorderBuffer = do
+    --liftIO $ putStrLn "printerReorder"
+    cfg <- ask
+    mNewQuote <- liftIO . takeMVar $ drawer cfg
+    case mNewQuote of
+        -- print any quotes that are old enough
+        Just newQuote -> do
+            newReorderBuffer <- printOlderThan reorderBuffer (acceptTime newQuote)
+            printerReorder (Heap.insert newQuote newReorderBuffer)
+        Nothing -> do
+            logMsg "stream appears to have ended."
+            flushReordered reorderBuffer
+            liftIO $ putMVar (finishedPrinting cfg) True  -- ensure this doesn't deadlock   !!!!!
+
+--
+printerBufferReorder :: Q.MyQueue Quote -> Heap.MinHeap Quote -> ReaderT Config IO ()
+printerBufferReorder queue reorderBuffer = do
+    --liftIO $ putStrLn "printerBufferReorder"
+    cfg <- ask
+    --logMsg $ "queue size = " ++ (show $ Q.size queue)
+    mmNewQuote <- liftIO . tryTakeMVar $ drawer cfg 
+    case mmNewQuote of
+        Just mNewQuote -> handleMNewQuote mNewQuote
+        Nothing -> do
+            -- No new quote, so use this opportunity to pop one from the buffer
+            let (poppedQueue, mQuote) = Q.pop queue
+            case mQuote of
+                -- Queue empty. Nice! We can block until a new quote arrives.
+                Nothing -> (liftIO . takeMVar $ drawer cfg) >>= handleMNewQuote
+                -- Transfer quote from buffer (queue) to reorder buffer
+                Just quote -> do  
+                    newReorderBuffer <- printOlderThan reorderBuffer (acceptTime quote)
+                    printerBufferReorder poppedQueue (Heap.insert quote newReorderBuffer)
+        where 
+            handleMNewQuote mNewQuote = do
+                cfg <- ask
+                case mNewQuote of
+                    Just newQuote -> do
+                        -- try to put new quote onto buffer 
+                        if Q.size queue >= bufsize cfg then do  
+                            -- buffer full, so skip this quote and pop one from the buffer
+                            let (poppedQueue, mQuote) = Q.pop queue
+                            case mQuote of
+                                -- insert popped quote into reorder buffer
+                                Just quote ->  do
+                                    newReorderBuffer <- printOlderThan reorderBuffer (acceptTime quote)
+                                    printerBufferReorder poppedQueue newReorderBuffer
+                                Nothing -> error "full queue has no items    2"
+                        else printerBufferReorder (Q.push newQuote queue) reorderBuffer  
+                    Nothing -> do
+                        logMsg "stream appears to have ended."
+                        -- move all from queue into reorderBuffer before flushing
+                        if Q.size queue > 0 then do
+                            logMsg "transferring queue"
+                            transferBuffer queue reorderBuffer >>= flushReordered
+                        else
+                            flushReordered reorderBuffer
+                        liftIO $ putMVar  (finishedPrinting cfg) True
 
 -- read the next UDP packet from a pcap
 -- Returns Nothing when stream ends
-nextQuote :: Config -> BSLC.ByteString -> Maybe (Quote, BSLC.ByteString)
-nextQuote cfg stream = 
+nextQuote :: String -> BSLC.ByteString -> Maybe (Quote, BSLC.ByteString)
+nextQuote key stream = 
     if not (BSLC.null stream) then do
         -- extract PCAP header
         let (pcapHeader, rest)              = BSLC.splitAt 16 stream
@@ -331,66 +341,68 @@ nextQuote cfg stream =
         if intDestPort `elem` [15515, 15516] then do
             let (keyVal,        rest3)      = BSLC.splitAt 5 $ BSLC.drop 4 rest2
             let (packetQuote,   rest4)      = BSLC.splitAt 210 rest3
-            if BSLC.unpack keyVal == key cfg
+            if BSLC.unpack keyVal == key
             then Just (packetToQuote packetTime packetQuote, rest4)
-            else nextQuote cfg $ BSLC.drop pcapLength rest -- rest used twice !!!!!!!!!1
-        else nextQuote cfg  $ BSLC.drop pcapLength rest
+            else nextQuote key $ BSLC.drop pcapLength rest -- rest used twice !!!!!!!!!1
+        else nextQuote key $ BSLC.drop pcapLength rest
     else Nothing
 
--- see if there's a quote in the drawer
-nextQuoteDrawer :: Config -> IO (Maybe Quote)
-nextQuoteDrawer cfg = tryTakeMVar $ drawer cfg                    
-
 --
-logMsg :: Config -> String -> IO ()
-logMsg cfg s = if verbose cfg then putStrLn s else return ()
+logMsg :: String -> ReaderT Config IO ()
+{-# INLINE logMsg #-}
+logMsg msg = asks verbose >>= (\v -> if v then liftIO . putStrLn $ msg else return ())
 
 -- Result is the modified heap
-printOlderThan :: Config -> Heap.MinHeap Quote -> Int -> IO (Heap.MinHeap Quote)
-printOlderThan cfg reorderBuf newAcceptTime =
+printOlderThan :: Heap.MinHeap Quote -> Int -> ReaderT Config IO (Heap.MinHeap Quote)
+printOlderThan reorderBuf newAcceptTime = do
+    cfg <- ask
     case Heap.view reorderBuf of
         Nothing -> return reorderBuf
         Just (oldestQuote, poppedBuf) -> do
             if newAcceptTime - (acceptTime oldestQuote) > (sortDelay cfg) then do
-                printQuote cfg oldestQuote
-                printOlderThan cfg poppedBuf newAcceptTime
+                printQuote oldestQuote
+                printOlderThan poppedBuf newAcceptTime
             else return reorderBuf
 
 -- transfers quotes from queue to reorder buffer, while printing from reorder buffer
-transferBuffer :: Config -> Q.MyQueue Quote -> Heap.MinHeap Quote -> IO (Heap.MinHeap Quote)
-transferBuffer c q rb = do
+transferBuffer :: Q.MyQueue Quote -> Heap.MinHeap Quote -> ReaderT Config IO (Heap.MinHeap Quote)
+transferBuffer q rb = do
     --putStrLn "trasnferBuffer"
+    cfg <- ask
     let (poppedQueue, mQuote) = Q.pop q
     case mQuote of
         Just quote -> do  -- insert popped quote into reorder buffer
-            newRB <- printOlderThan c rb (acceptTime quote)
-            transferBuffer c poppedQueue newRB
+            newRB <- printOlderThan rb (acceptTime quote)
+            transferBuffer poppedQueue newRB
         Nothing -> return rb
 
---
-flushBuffer :: Config -> Q.MyQueue Quote -> IO ()
-flushBuffer cfg queue = do
+-- Print quotes remaining in buffer
+flushBuffer :: Q.MyQueue Quote -> ReaderT Config IO ()
+flushBuffer queue = do
+    cfg <- ask
     let (poppedBuf, mQuote) = Q.pop queue
     case mQuote of
         Just q -> do
-            printQuote cfg q
-            flushBuffer cfg poppedBuf
-        Nothing -> return ()
+            printQuote q
+            flushBuffer poppedBuf
+        Nothing -> return ()  -- finished
 
---
-flushReordered :: Config -> Heap.MinHeap Quote -> IO ()
-flushReordered cfg buf = do
+-- Print remaining reordered quotes 
+flushReordered :: Heap.MinHeap Quote -> ReaderT Config IO ()
+flushReordered buf = do
+    cfg <- ask
     case Heap.view buf of
         Just (oldestQuote, poppedBuf) -> do
-            printQuote cfg oldestQuote
-            flushReordered cfg poppedBuf
-        Nothing -> return ()
+            printQuote oldestQuote
+            flushReordered poppedBuf
+        Nothing -> return ()  -- finished
 
 {- Leading pad with zeros. 
     `n` is the target length.
-    If `s` has length more than `n`, just return `s`.
+    If `s` matches or exceeds target length, return `s` as-is.
 -}
 padWithZeros :: Int -> String -> String
+{-# INLINE padWithZeros #-}
 padWithZeros n s
     | len >= n = s
     | otherwise = replicate (n - len) '0' ++ s
@@ -398,6 +410,7 @@ padWithZeros n s
 
 {- Accept packet time and the 210 bytes after B6034 and turn them into a quote -}
 packetToQuote :: String -> BSLC.ByteString -> Quote
+{-# INLINE packetToQuote #-}
 packetToQuote packetTime bs = Quote packetTime issueCode b1 b2 b3 b4 b5 a1 a2 a3 a4 a5 acceptTime
    where
        items = map BSLC.unpack $ split (bs) [12,12, 5,7,5,7,5,7,5,7,5,7, 7, 5,7,5,7,5,7,5,7,5,7, 50, 8, 1]
@@ -415,35 +428,38 @@ packetToQuote packetTime bs = Quote packetTime issueCode b1 b2 b3 b4 b5 a1 a2 a3
        acceptTime = read (items!!24)::Int
 
 {- Prints a Quote. -}
-printQuote :: Config -> Quote -> IO ()
-printQuote cfg quote = do
-    if ticker cfg then do
+printQuote :: Quote -> ReaderT Config IO ()
+{-# INLINE printQuote #-}
+printQuote quote = do
+    cfg <- ask
+    if ticker cfg then liftIO $ do
         setCursorColumn 0
-        putStr $ show quote
+        putStr $ ( show quote )
     else
-        putStrLn $ show quote
+        liftIO . putStrLn $ show quote
 
 {- Break a byte string up into arbitrarily sized substrings. -}
 split :: BSLC.ByteString -> [Int64] -> [BSLC.ByteString]
+{-# INLINE split #-}
 split _ [] = []
 split bs (size:sizes) = BSLC.take size bs : split (BSLC.drop size bs) sizes
 
 {- Quote data type -}
 data Quote = Quote
     {                      
-      packetTime :: String
-    , issueCode  :: String 
-    , b1         :: String 
-    , b2         :: String 
-    , b3         :: String 
-    , b4         :: String 
-    , b5         :: String 
-    , a1         :: String    
-    , a2         :: String
-    , a3         :: String
-    , a4         :: String
-    , a5         :: String
-    , acceptTime :: Int
+      packetTime :: !String
+    , issueCode  :: !String 
+    , b1         :: !String 
+    , b2         :: !String 
+    , b3         :: !String 
+    , b4         :: !String 
+    , b5         :: !String 
+    , a1         :: !String    
+    , a2         :: !String
+    , a3         :: !String
+    , a4         :: !String
+    , a5         :: !String
+    , acceptTime :: !Int
     } deriving (Eq)
 
 {- `Show` instance for `Quote` -}
