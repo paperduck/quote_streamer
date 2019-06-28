@@ -1,22 +1,12 @@
---{-# OPTIONS_GHC -Wall #-}
---{-# OPTIONS_GHC -Werror #-}
---{-# OPTIONS_GHC -fno-omit-yields #-}
 
 {-
 TODO
+    README: explain what a transaction drawer is
+    README: "A single MVar is used to create a skip channel, eliminating bottleneck"
+    README: buffer is sort of a debounce
     haddock comments
-    currying
-    readerT for args
-    rest of options
-    make sure buffer size positive
     rest used twice
-    thread safe (protect MVars via semaphore?)
-    explain what a transaction drawer is
-    "A single MVar is used to separate... disjoint
-    buffer is sort of a debounce
     test cases
-    verbose output
-    ReaderT is mainly used to demonstrate ability. Can't use in forked thread?
 -}
 
 {- README
@@ -32,7 +22,7 @@ import           Control.Exception
 import qualified Data.ByteString.Lazy.Char8         as BSLC
 import qualified Data.Heap                          as Heap
 import           Data.Int (Int64)
---import           Data.Map.Strict (Map, fromList, lookup)
+import           Data.List (nub)
 import           Network.Transport.Internal (decodeNum16, decodeNum32)
 import           System.Console.GetOpt
 import           System.Console.ANSI
@@ -40,9 +30,6 @@ import           System.Environment
 import           Control.Monad.Reader
 
 import qualified MyQueue as Q
-
---data EndOfStreamException = EndOfStreamException e
---instance Exception EndOfStreamException
 
 data Config = Config {
      filename           :: !String
@@ -64,18 +51,16 @@ data Config = Config {
 getBufferSize :: [Flag] -> Maybe Int
 {-# INLINE getBufferSize #-}
 getBufferSize flags = case sizes of
-    x:_ -> Just $ abs x
+    x:_ -> Just x
     [] -> Nothing
     where sizes = [size | Buffer size <- flags]
 
 {- main -}
 main :: IO ()
 main = do
-    (optArgs, nonOpts, unrecOpts, errs) <- parseArgs
+    (optArgs, nonOpts, unrecOpts, cmdErrs) <- parseArgs
 
-    -- show help if needed
-    if (Help `elem` optArgs) then showHelp
-    else do
+    do
         -- create skip channel
         emptyDrawer                 <- newEmptyMVar 
         finishedPrintingSemaphore   <- newEmptyMVar
@@ -101,43 +86,50 @@ main = do
             ,endOfStream=endOfStreamSemaphore
             ,finishedPrinting=finishedPrintingSemaphore
         }
-        runReaderT (logMsg $ "option args: " ++ show optArgs) config
-        runReaderT (logMsg $ "non options: " ++ show nonOpts) config
-        runReaderT (logMsg $ "unrecognized options" ++ show unrecOpts) config
-        runReaderT (logMsg $ "errs" ++ show errs) config
-        runReaderT (logMsg "") config
+        runReaderT (logMsg $ "\nOption arguments: "       ++ show optArgs
+                          ++ "\nNon options: "            ++ show nonOpts
+                          ++ "\nUnrecognized options: "   ++ show unrecOpts
+                          ++ "\nOption erorrs: "          ++ show cmdErrs
+            ) config
 
-        -- Buffer pointless when not multithreaded
-        let errs' = errs ++ if not (skip config) && buffer config
-            then ["Buffer option cannot be used without skip channel."]
-            else []
-
-        case errs' of
+        let errorMsgs = cmdErrs
+                -- unrecognized options
+                ++ (map ("Unrecognized option: " ++) unrecOpts)
+                -- bufsize must be > 0
+                ++ (if (buffer config) && (bufsize config <= 0) then ["Buffer size must be greater than zero."] else [])
+                -- Buffer pointless when not multithreaded
+                ++ (if not (skip config) && buffer config
+                    then ["Buffer option cannot be used without skip channel."]
+                    else [])
+        case errorMsgs of
             [] -> do
-                stream <- ((BSLC.drop 24) <$> (BSLC.readFile $ filename config)) -- open pcap file
-                if skip config then do
-                    -- Launch a printer thread before the stream starts
-                    if buffer config then
-                        if reorder config then forkIO $ runReaderT (printerBufferReorder Q.empty Heap.empty) config
-                        else                   forkIO $ runReaderT (printerBuffer        Q.empty)            config
+                if (Help `elem` optArgs)  -- show help if needed
+                then showHelp
+                else do
+                    stream <- ((BSLC.drop 24) <$> (BSLC.readFile $ filename config)) -- open pcap file
+                    if skip config then do
+                        -- Launch a printer thread before the stream starts
+                        if buffer config then
+                            if reorder config then forkIO $ runReaderT (printerBufferReorder Q.empty Heap.empty) config
+                            else                   forkIO $ runReaderT (printerBuffer        Q.empty)            config
+                        else
+                            if reorder config then forkIO $ runReaderT (printerReorder               Heap.empty) config
+                            else                   forkIO $ runReaderT (printer                                ) config
+                        runReaderT (listenThreaded stream) config
                     else
-                        if reorder config then forkIO $ runReaderT (printerReorder               Heap.empty) config
-                        else                   forkIO $ runReaderT (printer                                ) config
-                    runReaderT (listenThreaded stream) config
-                else
-                    if reorder config then runReaderT (listenReorder stream Heap.empty) config
-                    else                   runReaderT (listen        stream)            config
-                if skip config then do
-                    runReaderT (logMsg "\nsignalling end of stream") config
-                    putMVar (drawer config) Nothing      -- signal to flush printer thread
-                    runReaderT (logMsg "waiting for printer thread to finish") config 
-                    finished <- takeMVar $ finishedPrinting config  -- wait for the printer thread to flush
-                    runReaderT (logMsg "printer appears to have  finished") config
-                else return ()
-                if ticker config then putStr "\n" else return ()  -- ticker leaves cursor at end of line
+                        if reorder config then runReaderT (listenReorder stream Heap.empty) config
+                        else                   runReaderT (listen        stream)            config
+                    if skip config then do
+                        runReaderT (logMsg "\nsignalling end of stream") config
+                        putMVar (drawer config) Nothing      -- signal to flush printer thread
+                        runReaderT (logMsg "waiting for printer thread to finish") config 
+                        finished <- takeMVar $ finishedPrinting config  -- wait for the printer thread to flush
+                        runReaderT (logMsg "printer appears to have  finished") config
+                    else return ()
+                    if ticker config then putStr "\n" else return ()  -- ticker leaves cursor at end of line
             es -> do
-                runReaderT (logMsg "Option error(s):") config
-                traverse_ (\e -> putStrLn $ "    " ++ e) es
+                putStrLn "\nPlease fix the following error(s):"
+                traverse_ (\e -> putStrLn $ "    --> " ++ e) (nub es)
 
 parseArgs = do
     cliArgs <- getArgs
@@ -270,7 +262,7 @@ printerReorder reorderBuffer = do
         Just newQuote -> do
             newReorderBuffer <- printOlderThan reorderBuffer (acceptTime newQuote)
             printerReorder (Heap.insert newQuote newReorderBuffer)
-        Nothing -> do
+        Nothing -> do  -- end of stream
             logMsg "stream appears to have ended."
             flushReordered reorderBuffer
             liftIO $ putMVar (finishedPrinting cfg) True  -- ensure this doesn't deadlock   !!!!!
@@ -310,14 +302,9 @@ printerBufferReorder queue reorderBuffer = do
                                     printerBufferReorder poppedQueue newReorderBuffer
                                 Nothing -> error "full queue has no items    2"
                         else printerBufferReorder (Q.push newQuote queue) reorderBuffer  
-                    Nothing -> do
+                    Nothing -> do  -- stream ended
                         logMsg "stream appears to have ended."
-                        -- move all from queue into reorderBuffer before flushing
-                        if Q.size queue > 0 then do
-                            logMsg "transferring queue"
-                            transferBuffer queue reorderBuffer >>= flushReordered
-                        else
-                            flushReordered reorderBuffer
+                        flushAll queue reorderBuffer 
                         liftIO $ putMVar  (finishedPrinting cfg) True
 
 -- read the next UDP packet from a pcap
@@ -364,17 +351,18 @@ printOlderThan reorderBuf newAcceptTime = do
                 printOlderThan poppedBuf newAcceptTime
             else return reorderBuf
 
--- transfers quotes from queue to reorder buffer, while printing from reorder buffer
-transferBuffer :: Q.MyQueue Quote -> Heap.MinHeap Quote -> ReaderT Config IO (Heap.MinHeap Quote)
-transferBuffer q rb = do
-    --putStrLn "trasnferBuffer"
+-- transfers quotes from queue to reorder buffer, while printing from reorder buffer.
+-- Then printing quotes remaining in reorder buffer.
+flushAll :: Q.MyQueue Quote -> Heap.MinHeap Quote -> ReaderT Config IO ()
+flushAll q rb = do
+    --putStrLn "flushAll"
     cfg <- ask
     let (poppedQueue, mQuote) = Q.pop q
     case mQuote of
         Just quote -> do  -- insert popped quote into reorder buffer
             newRB <- printOlderThan rb (acceptTime quote)
-            transferBuffer poppedQueue newRB
-        Nothing -> return rb
+            flushAll poppedQueue newRB
+        Nothing -> flushReordered rb
 
 -- Print quotes remaining in buffer
 flushBuffer :: Q.MyQueue Quote -> ReaderT Config IO ()
