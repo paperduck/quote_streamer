@@ -28,21 +28,20 @@ TODO
 
 module Main where
 
-import           Data.Foldable(traverse_)
-import           Control.Concurrent
-import           Control.Concurrent.MVar
-import           Control.Exception
-import qualified Data.ByteString.Lazy.Char8         as BSLC
-import qualified Data.Heap                          as Heap
-import           Data.Int (Int64)
-import           Data.List (nub)
+import           Data.Foldable              (traverse_)
+import           Control.Concurrent         (forkIO)
+import           Control.Concurrent.MVar    (MVar, takeMVar, putMVar, tryTakeMVar, tryPutMVar, newEmptyMVar)
+import qualified Data.ByteString.Lazy.Char8 as BSLC
+import qualified Data.Heap                  as Heap
+import           Data.Int                   (Int64)
+import           Data.List                  (nub)
 import           Network.Transport.Internal (decodeNum16, decodeNum32)
-import           System.Console.GetOpt
-import           System.Console.ANSI
-import           System.Environment
-import           Control.Monad.Reader
+import           System.Console.GetOpt      (getOpt', OptDescr(Option), ArgDescr(ReqArg, NoArg), usageInfo, ArgOrder(Permute))
+import           System.Console.ANSI        (setCursorColumn)
+import           System.Environment         (getArgs)
+import           Control.Monad.Reader       (runReaderT, ReaderT, ask, asks, liftIO, liftM)
 
-import qualified MyQueue as Q
+import qualified MyQueue                    as Q
 
 data Config = Config {
      filename           :: !String
