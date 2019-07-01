@@ -18,7 +18,6 @@ cabal-version:       >=1.10
 
 library
   ghc-options:          -Wall -Werror -O2 -v
-                        -fwarn-missing-signatures
   default-language:     Haskell2010
 
 executable cs
