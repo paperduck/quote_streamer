@@ -11,7 +11,7 @@ data Config = Config {
      filename           :: !String
     ,verbose            :: !Bool
     ,sortDelay          :: !Int
-    ,key                :: !String
+    ,quoteType          :: !String
     ,ports              :: ![Int]
     ,reorder            :: !Bool
     ,ticker             :: !Bool

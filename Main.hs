@@ -8,15 +8,12 @@ TODO
 -}
 
 {- UPDATES SINCE v.1
-    Removed padWithZeros
-    Use * instead of decodeNum32 
-        - decodeNum32 uses unsafeIO
-        - it's nice to have one less dependancy
+    Removed padWithZeros, process packet time as Int instead of String.
+    Use myDecodeInt functions instead of Network.Transport.Internal.decodeNum functions
+        - for simplicity
+        - The Network functions use unsafeIO
+        - one less dependancy
     add command line options
-        - multithreading / skip channel
-        - buffer
-        - ticker
-        - verbosity
     put environment into ReaderT
     added INLINE pragmas
     Added GHC option to increase compiler optmizations
@@ -26,34 +23,48 @@ TODO
 -}
 
 {- README
-    UDP parsing still very rudimentary
-    quote pipeline:  stream  -> drawer -> buffer -> reorder queue -> printer
-    explain what a transaction drawer is
-    "A single MVar is used to create a skip channel, eliminating bottleneck"
-    buffer is sort of a debounce
+    > Command line options
+        - multithreading / skip channel
+        - buffer
+        - ticker
+        - verbosity
+    > UDP parsing is bare minimum, custom tailored for PCAP file
+    > quote pipeline:  stream  -> drawer -> buffer -> reorder queue -> printer
+    > explain what a transaction drawer is
+    > "A single MVar is used to create a skip channel, eliminating bottleneck"
     
-    KNOWN BUGS
-    If your terminal is not wide enough to fit the whole quote on one line,
-         the ticker option (-t) may not work as expected.
+    KNOWN ISSUES    
+    - The gist of the buffer is to prevent data loss while prioritizing the intake speed of the stream.
+          Unfortunately, it appears that MVars impose more latency than 
+          printing to STDIO, rendering the buffer useless because the quotes arrive in the buffer slower than they are printed.
+         This could be addressed by buffering quotes in the main thread, before they are handed off to
+          the drawer. For this particular application, the buffer would fill up quickly and would end up preserving a contiguous chunk of quotes from
+            the beginning of the stream.
+    If your terminal is not wide enough to fit a whole quote on one line,
+         the ticker option may not work as expected.
 -}
 
 module Main where
 
+--
 import           Control.Concurrent         (forkIO)
-import           Control.Concurrent.MVar    (takeMVar, putMVar, tryTakeMVar, tryPutMVar, newEmptyMVar)
-import qualified Data.ByteString.Lazy       as BSL
+import           Control.Concurrent.MVar    (takeMVar, putMVar, tryTakeMVar
+                                            , tryPutMVar, newEmptyMVar)
+import           Control.Monad.Reader       (runReaderT, ReaderT, ask, liftIO
+                                            , liftM)
 import qualified Data.ByteString.Lazy.Char8 as BSLC
 import qualified Data.Heap                  as Heap
 import           Data.Int                   (Int64)
-import           Data.Maybe                 (maybeToList)
---import           Network.Transport.Internal (decodeNum32, decodeNum16)
-import           System.Console.GetOpt      (getOpt', OptDescr(Option), ArgDescr(ReqArg, NoArg), usageInfo, ArgOrder(Permute))
+import           System.Console.GetOpt      (getOpt', OptDescr(Option)
+                                            , ArgDescr(ReqArg, NoArg)
+                                            , usageInfo
+                                            , ArgOrder(Permute))
 import           System.Environment         (getArgs)
-import           Control.Monad.Reader       (runReaderT, ReaderT, ask, liftIO, liftM)
-
+--
 import           Model                      (Config(..), Flag(..), Quote(..))
-import           View                       (logMsg, printQuote, showErrors)
 import qualified MyQueue                    as Q
+import           Utility                    (splitAts, myDecodeInt16, myDecodeInt32)
+import           View                       (logMsg, printQuote, showErrors)
 
 -- Parse out the buffer size, if it exists, from the option flags
 getBufferSize :: [Flag] -> Maybe Int
@@ -69,7 +80,7 @@ main = do
     -- Gather command line options
     (optArgs, nonOpts, unrecOpts, cmdErrs)  <- liftM (getOpt' Permute options) getArgs
 
-    -- environment settings
+    -- environment configuration settings
     emptyDrawer                 <- newEmptyMVar 
     finishedPrintingSemaphore   <- newEmptyMVar
     endOfStreamSemaphore        <- newEmptyMVar
@@ -78,7 +89,7 @@ main = do
         filename            ="mdf-kospi200.20110216-0.pcap"
         ,verbose            =(Verbose `elem` optArgs)
         ,sortDelay          =300      -- accept time threshold in 1/100 seconds 
-        ,key                ="B6034"  -- target  Data Type + Information Type + Market Type
+        ,quoteType          ="B6034"  -- target  Data Type + Information Type + Market Type
         ,ports              =[15515, 15516]
         ,reorder            =(Reorder `elem` optArgs)
         ,ticker             =(Ticker `elem` optArgs)
@@ -95,10 +106,11 @@ main = do
     }
 
     -- Show command line options
-    runReaderT (logMsg $ "\nOption arguments: " ++ show optArgs
-        ++ "\nNon options: "            ++ show nonOpts
-        ++ "\nUnrecognized options: "   ++ show unrecOpts
-        ++ "\nOption erorrs: "          ++ show cmdErrs    ) config
+    runReaderT (logMsg $ 
+           "\nOption arguments:     " ++ show optArgs
+        ++ "\nNon options:          " ++ show nonOpts
+        ++ "\nUnrecognized options: " ++ show unrecOpts
+        ++ "\nOption errors:        " ++ show cmdErrs    ) config
     
     -- Gather all error messages
     let errorMsgs = cmdErrs
@@ -112,8 +124,9 @@ main = do
             ++ if not (skip config) && buffer config
                 then ["Buffer option cannot be used without skip channel."]
                 else []
+    --
     case errorMsgs of
-        [] -> if (Help `elem` optArgs)  -- show help
+        [] -> if (Help `elem` optArgs)  -- prioritize help
             then putStrLn $ usageInfo "\nUsage:\n" options
             else do
                 -- open pcap file and drop pcap header
@@ -140,28 +153,25 @@ main = do
                     runReaderT (logMsg "\nPrinter thread appears to have finished.") config
                 else return ()
                 -- ticker leaves cursor at end of line
-                if ticker config then putStr "\n" else return ()
+                if ticker config then putStrLn "" else return ()
         es -> showErrors es
 
-{--}
+-- Returns a description of possible command line options
 options :: [OptDescr Flag]
 {-# INLINE options #-}
 options = [ 
-     Option ['v'] ["verbose"] (NoArg Verbose) 
-        "Verbose output"
-    ,Option ['h'] ["help"] (NoArg Help) 
-        "Show help"
-    ,Option ['r'] ["reorder"] (NoArg Reorder) 
-        "Reorder by quote accept time"
-    ,Option ['t'] ["ticker"] (NoArg Ticker) 
+     Option ['v'] ["verbose"] (NoArg Verbose) "Verbose output"
+    ,Option ['h'] ["help"]    (NoArg Help)    "Show help"
+    ,Option ['r'] ["reorder"] (NoArg Reorder) "Reorder by quote accept time"
+    ,Option ['t'] ["ticker"]  (NoArg Ticker) 
         "Each quote overwrites the previous one"
     ,Option ['s'] ["skip-channel"] (NoArg Skip) 
         "Skip quotes to eliminate printing bottleneck."
-    ,Option ['b'] ["buffer"] (ReqArg (\s -> Buffer (read s::Int)) "BUFSIZE")
+    ,Option ['b'] ["buffer"]  (ReqArg (\s -> Buffer (read s::Int)) "BUFSIZE")
         "Buffer up to n quotes to be printed. Not as useful as it seems."
     ]
 
--- no skip, no queue, no reorder
+-- Take a quote from the stream and print it
 listen :: BSLC.ByteString -> ReaderT Config IO ()
 listen stream = do
     cfg <- ask
@@ -172,7 +182,7 @@ listen stream = do
             listen streamRest
         Nothing -> return ()  -- end of stream
 
---
+-- Take a quote from the stream and reorder it
 listenReorder :: BSLC.ByteString -> Heap.MinHeap Quote -> ReaderT Config IO ()
 listenReorder stream reorderBuffer = do
     cfg <- ask
@@ -183,7 +193,7 @@ listenReorder stream reorderBuffer = do
             listenReorder streamRest (Heap.insert newQuote poppedReorderBuffer)
         Nothing -> flushReordered reorderBuffer  -- end of stream
 
---
+-- Take a quote from the stream and hand it to a printer thread
 listenThreaded :: BSLC.ByteString -> ReaderT Config IO ()
 listenThreaded stream = do
     cfg <- ask
@@ -194,8 +204,7 @@ listenThreaded stream = do
             listenThreaded streamRest
         Nothing -> return ()  -- end of stream
 
--- monitor transaction drawer for new quotes and process them.
--- Because MVars are so slow, this should only be used in conjunction with a skip channel
+-- Take a quote from the drawer and print it.
 printer :: ReaderT Config IO ()
 printer = do
     cfg <- ask
@@ -206,83 +215,65 @@ printer = do
             liftIO $ putMVar (finishedPrinting cfg) True
         Just newQuote -> printQuote newQuote >> printer
 
--- tryTake  
---          -> Just mNewQ   
---                        (1)  -> Just newQ     -> buffer is  full  -> print 1 from buffer  -> recurse
---                                              -> buffer not full  -> push to buffer -> recurse
---                        (2)  -> Just Nothing  -> end of stream
---          -> Nothing      
---                          -> buffer empty     -> take (block) 
---                                                              -> (1)
---                                                              -> (2)
---                          -> buffer not empty -> print 1 from buffer  -> recurse
+-- Take a quote from the drawer and buffer it. 
+-- If buffer full, pop a quote and print that instead.
 printerBuffer :: Q.MyQueue Quote -> ReaderT Config IO ()
 printerBuffer queue = do
     cfg <- ask
-    --logMsg $ "queue size = " ++ (show $ Q.size queue)
     mmNewQuote <- liftIO . tryTakeMVar $ drawer cfg
     case mmNewQuote of
-        Just mNewQuote -> handleMNewQuote mNewQuote
-        Nothing -> do 
-            -- No new quote, so use this opportunity to pop the buffer
+        Just mNewQuote -> handleMNewQuote mNewQuote  -- maybe new quote
+        Nothing -> do  -- No new quote; use this opportunity to pop buffer
             let (poppedQueue, mQuote) = Q.pop queue
             case mQuote of
-                -- buffer is empty, so we can block
-                Nothing -> do
-                    mNewQuote <- liftIO . takeMVar $ drawer cfg
-                    handleMNewQuote mNewQuote  
-                -- pop from buffer
+                -- buffer is empty, so we can block until next quote arrives
+                Nothing -> liftIO (takeMVar $ drawer cfg) >>= handleMNewQuote
+                -- pop quote from buffer and print it
                 Just quote -> printQuote quote >> printerBuffer poppedQueue
-        where
-            handleMNewQuote mNewQuote = do
+        where handleMNewQuote mNewQuote = do
                 cfg <- ask
                 case mNewQuote of
                     Just newQuote -> if Q.size queue >= bufsize cfg
-                         -- queue full; skip new quote
-                        then do 
+                        then do  -- buffer full; skip new quote
                             let (poppedQueue, mQuote) = Q.pop queue
                             case mQuote of
-                                Just quote -> do
-                                    printQuote quote
-                                    printerBuffer poppedQueue
-                                Nothing -> error "full queue has no items"
-
-                        else printerBuffer (Q.push newQuote queue)  -- quickly add to queue without printing anything
-                    Nothing -> do  -- end of stream
+                                Just quote -> printQuote quote >> printerBuffer poppedQueue
+                                Nothing -> error "printerBuffer: full queue has no items"
+                        -- quickly add to buffer without printing anything
+                        else printerBuffer (Q.push newQuote queue)  
+                    Nothing -> do  -- end of stream has been signalled
                         logMsg "\nstream appears to have ended."
                         flushBuffer queue
-                        liftIO $ putMVar (finishedPrinting cfg) True  -- !!!! prevent deadlock?
+                        liftIO $ putMVar (finishedPrinting cfg) True
 
---
+-- Take a quote from the drawer and reorder it.
 printerReorder :: Heap.MinHeap Quote -> ReaderT Config IO ()
 printerReorder reorderBuffer = do
     cfg <- ask
     mNewQuote <- liftIO . takeMVar $ drawer cfg
     case mNewQuote of
-        -- print any quotes that are old enough
-        Just newQuote -> do
+        Just newQuote -> do  -- print any quotes that are old enough
             newReorderBuffer <- printOlderThan reorderBuffer (acceptTime newQuote)
             printerReorder (Heap.insert newQuote newReorderBuffer)
         Nothing -> do  -- end of stream
             logMsg "\nstream appears to have ended."
             flushReordered reorderBuffer
-            liftIO $ putMVar (finishedPrinting cfg) True  -- ensure this doesn't deadlock   !!!!!
+            liftIO $ putMVar (finishedPrinting cfg) True
 
---
+-- Take a quote from the drawer and buffer it. 
+-- If buffer full or no new quote, pop a quote and reorder it.
 printerBufferReorder :: Q.MyQueue Quote -> Heap.MinHeap Quote -> ReaderT Config IO ()
 printerBufferReorder queue reorderBuffer = do
     cfg <- ask
-    --logMsg $ "queue size = " ++ (show $ Q.size queue)
     mmNewQuote <- liftIO . tryTakeMVar $ drawer cfg 
     case mmNewQuote of
-        Just mNewQuote -> handleMNewQuote mNewQuote
-        Nothing -> do
-            -- No new quote, so use this opportunity to pop one from the buffer
+        Just mNewQuote -> handleMNewQuote mNewQuote -- maybe new quote
+        Nothing -> do  -- No new quote; use this opportunity to pop buffer
             let (poppedQueue, mQuote) = Q.pop queue
             case mQuote of
-                -- Queue empty. Nice! We can block until a new quote arrives.
+                -- Buffer is empty, so we can block until a new quote arrives.
                 Nothing -> (liftIO . takeMVar $ drawer cfg) >>= handleMNewQuote
-                -- Transfer quote from buffer (queue) to reorder buffer
+                -- Pop quote from buffer and reorder it
                 Just quote -> do  
                     newReorderBuffer <- printOlderThan reorderBuffer (acceptTime quote)
                     printerBufferReorder poppedQueue (Heap.insert quote newReorderBuffer)
@@ -290,31 +281,20 @@ printerBufferReorder queue reorderBuffer = do
             handleMNewQuote mNewQuote = do
                 cfg <- ask
                 case mNewQuote of
-                    Just newQuote -> do
-                        -- try to put new quote onto buffer 
-                        if Q.size queue >= bufsize cfg then do  
-                            -- buffer full, so skip this quote and pop one from the buffer
+                    Just newQuote -> if Q.size queue >= bufsize cfg
+                        then do   -- buffer full; skip new quote
                             let (poppedQueue, mQuote) = Q.pop queue
                             case mQuote of
-                                -- insert popped quote into reorder buffer
-                                Just quote ->  do
+                                Just quote ->  do  -- insert to reorder buffer
                                     newReorderBuffer <- printOlderThan reorderBuffer (acceptTime quote)
                                     printerBufferReorder poppedQueue newReorderBuffer
-                                Nothing -> error "full queue has no items    2"
-                        else printerBufferReorder (Q.push newQuote queue) reorderBuffer  
+                                Nothing -> error "printerBufferReorder: full queue has no items"
+                        -- quickly add to buffer without printing anything
+                        else printerBufferReorder (Q.push newQuote queue) reorderBuffer
                     Nothing -> do  -- stream ended
                         logMsg "\nstream appears to have ended."
                         flushAll queue reorderBuffer 
                         liftIO $ putMVar  (finishedPrinting cfg) True
-
--- read all the bytes
-myDecodeInt :: BSLC.ByteString -> Int
-myDecodeInt bs = myDecodeInt' 0 bs
-
-myDecodeInt' :: Int -> BSLC.ByteString -> Int
-myDecodeInt' total bs 
-    | BSLC.null bs = total
-    | otherwise = myDecodeInt' ((total * 256) + (fromIntegral (BSL.head bs)::Int)) (BSLC.tail bs)
 
 -- get the next quote from the UDP stream
 -- Returns Nothing when stream ends
@@ -324,16 +304,21 @@ nextQuote stream = if not (BSLC.null stream)
         cfg <- ask
         -- extract pcap packet header
         let [bsPacketTimeSec, bsPacketTimeUSec, _, bsPacketLen, rest] = splitAts [4,4,4,4] stream
-        let [packetTimeSec, packetTimeUSec, packetLen] = map (myDecodeInt . BSLC.reverse) [bsPacketTimeSec, bsPacketTimeUSec, bsPacketLen]
+        let [packetTimeSec, packetTimeUSec, packetLen] 
+                = map
+                    (myDecodeInt32 . BSLC.reverse)
+                    [bsPacketTimeSec, bsPacketTimeUSec, bsPacketLen]
         -- extract ethernet header, IPv4 header, UDP header
         let [_, bsDestPort, rest2] = splitAts[36,2] rest
-        if myDecodeInt bsDestPort `elem` [15515, 15516]
+        if myDecodeInt16 bsDestPort `elem` [15515, 15516]  -- filter by port
         then do
-            let [_, keyVal, packetQuote, rest3] = splitAts [4,5,210] rest2
-            if BSLC.unpack keyVal == key cfg
-            then return $ Just (packetToQuote (show (packetTimeSec * 1000000 + packetTimeUSec)) packetQuote, rest3)
+            let [_, quoteTypeVal, packetQuote, rest3] = splitAts [4,5,210] rest2
+            if BSLC.unpack quoteTypeVal == quoteType cfg  -- filter by quote type
+            then return $ Just
+                ( packetToQuote (show (packetTimeSec * 1000000 + packetTimeUSec)) packetQuote 
+                , rest3 )
             else nextQuote $ BSLC.drop ((fromIntegral packetLen::Int64)) rest
-        else nextQuote $ BSLC.drop ((fromIntegral packetLen::Int64)) rest
+        else     nextQuote $ BSLC.drop ((fromIntegral packetLen::Int64)) rest
     else return Nothing
 
 -- transfers quotes from queue to reorder buffer, while printing from reorder buffer.
@@ -343,9 +328,8 @@ flushAll q rb = do
     cfg <- ask
     let (poppedQueue, mQuote) = Q.pop q
     case mQuote of
-        Just quote -> do  -- insert popped quote into reorder buffer
-            newRB <- printOlderThan rb (acceptTime quote)
-            flushAll poppedQueue newRB
+        -- insert popped quote into reorder buffer
+        Just quote -> printOlderThan rb (acceptTime quote) >>= flushAll poppedQueue
         Nothing -> flushReordered rb
 
 -- Print quotes remaining in buffer
@@ -354,9 +338,7 @@ flushBuffer queue = do
     cfg <- ask
     let (poppedBuf, mQuote) = Q.pop queue
     case mQuote of
-        Just q -> do
-            printQuote q
-            flushBuffer poppedBuf
+        Just q -> printQuote q >> flushBuffer poppedBuf
         Nothing -> return ()  -- finished
 
 -- Print remaining reordered quotes 
@@ -381,7 +363,8 @@ printOlderThan reorderBuf newAcceptTime = do
                 printOlderThan poppedBuf newAcceptTime
             else return reorderBuf
 
-{- Accept packet time and the 210 bytes after B6034 and turn them into a quote -}
+-- Accept packet time and the 210 bytes after B6034,
+-- and turn them into a quote.
 packetToQuote :: String -> BSLC.ByteString -> Quote
 {-# INLINE packetToQuote #-}
 packetToQuote packetTime bs = Quote
@@ -400,13 +383,5 @@ packetToQuote packetTime bs = Quote
     (read (items!!24)::Int)         -- accept time
     where
         items = map BSLC.unpack $ init $ splitAts [12,12, 5,7,5,7,5,7,5,7,5,7, 7, 5,7,5,7,5,7,5,7,5,7, 50, 8, 1] bs
-
--- plural version of splitAt
--- If xs runs out early, copies of remaining xs will be returned.  !!!!!!???
-splitAts :: [Int] -> BSLC.ByteString  -> [BSLC.ByteString]
-splitAts [] xs = [xs]
-splitAts (n:ns) xs = taken:(splitAts ns dropped)
-    where (taken, dropped) = BSLC.splitAt (fromIntegral n::Int64) xs  -- xs itself if n > length xs.
-
 
 
