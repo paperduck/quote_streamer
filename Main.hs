@@ -2,10 +2,16 @@
 {-
 TODO
     test cases
+    check for duplicate packets
+    change packetTime to one big int to avoid trouble with string length
     undersatnd splitAts error cases
 -}
 
 {- UPDATES SINCE v.1
+    Removed padWithZeros
+    Use * instead of decodeNum32 
+        - decodeNum32 uses unsafeIO
+        - it's nice to have one less dependancy
     add command line options
         - multithreading / skip channel
         - buffer
@@ -20,6 +26,7 @@ TODO
 -}
 
 {- README
+    UDP parsing still very rudimentary
     quote pipeline:  stream  -> drawer -> buffer -> reorder queue -> printer
     explain what a transaction drawer is
     "A single MVar is used to create a skip channel, eliminating bottleneck"
@@ -34,10 +41,12 @@ module Main where
 
 import           Control.Concurrent         (forkIO)
 import           Control.Concurrent.MVar    (takeMVar, putMVar, tryTakeMVar, tryPutMVar, newEmptyMVar)
+import qualified Data.ByteString.Lazy       as BSL
 import qualified Data.ByteString.Lazy.Char8 as BSLC
 import qualified Data.Heap                  as Heap
 import           Data.Int                   (Int64)
-import           Network.Transport.Internal (decodeNum16, decodeNum32)
+import           Data.Maybe                 (maybeToList)
+--import           Network.Transport.Internal (decodeNum32, decodeNum16)
 import           System.Console.GetOpt      (getOpt', OptDescr(Option), ArgDescr(ReqArg, NoArg), usageInfo, ArgOrder(Permute))
 import           System.Environment         (getArgs)
 import           Control.Monad.Reader       (runReaderT, ReaderT, ask, liftIO, liftM)
@@ -156,7 +165,8 @@ options = [
 listen :: BSLC.ByteString -> ReaderT Config IO ()
 listen stream = do
     cfg <- ask
-    case nextQuote (key cfg) stream of
+    mq <- nextQuote stream
+    case mq of
         Just (newQuote, streamRest) -> do
             printQuote newQuote
             listen streamRest
@@ -166,7 +176,8 @@ listen stream = do
 listenReorder :: BSLC.ByteString -> Heap.MinHeap Quote -> ReaderT Config IO ()
 listenReorder stream reorderBuffer = do
     cfg <- ask
-    case nextQuote (key cfg) stream of
+    mq <- nextQuote stream
+    case mq of
         Just (newQuote, streamRest) -> do
             poppedReorderBuffer <- printOlderThan reorderBuffer (acceptTime newQuote)
             listenReorder streamRest (Heap.insert newQuote poppedReorderBuffer)
@@ -176,7 +187,8 @@ listenReorder stream reorderBuffer = do
 listenThreaded :: BSLC.ByteString -> ReaderT Config IO ()
 listenThreaded stream = do
     cfg <- ask
-    case nextQuote (key cfg) stream of
+    mq <- nextQuote stream
+    case mq of
         Just (newQuote, streamRest) -> do
             _ <- liftIO $ tryPutMVar (drawer cfg) (Just newQuote)
             listenThreaded streamRest
@@ -295,27 +307,34 @@ printerBufferReorder queue reorderBuffer = do
                         flushAll queue reorderBuffer 
                         liftIO $ putMVar  (finishedPrinting cfg) True
 
--- read the next UDP packet from a pcap
+-- read all the bytes
+myDecodeInt :: BSLC.ByteString -> Int
+myDecodeInt bs = myDecodeInt' 0 bs
+
+myDecodeInt' :: Int -> BSLC.ByteString -> Int
+myDecodeInt' total bs 
+    | BSLC.null bs = total
+    | otherwise = myDecodeInt' ((total * 256) + (fromIntegral (BSL.head bs)::Int)) (BSLC.tail bs)
+
+-- get the next quote from the UDP stream
 -- Returns Nothing when stream ends
-nextQuote :: String -> BSLC.ByteString -> Maybe (Quote, BSLC.ByteString)
-nextQuote key stream = 
-    if not (BSLC.null stream) then do
-        --  extract pcap packet header
-        let [bsPacketTimeSec, bsPacketTimeUSec, _, bsPacketLength, rest] = splitAts [4,4,4,4] stream
-        let packetTime = (show $ decodeNum32 $ BSLC.toStrict $ BSLC.reverse $ bsPacketTimeSec)
-             ++ (padWithZeros 6 $ show $ decodeNum32 $ BSLC.toStrict $ BSLC.reverse bsPacketTimeUSec)
-        let packetLength = decodeNum32 $ BSLC.toStrict $ BSLC.reverse bsPacketLength
-        -- extract header:  14 ethernet header + 20 IPv4 header + 8 UDP header (2:sourcePort + 2:destPort + 4:_)
-        let [_, bsDestPort, rest2] = splitAts [36, 2] rest
-        let intDestPort = decodeNum16 $ BSLC.toStrict bsDestPort
-        -- Check port
-        if intDestPort `elem` [15515, 15516] then do
-            let [_, keyVal, packetQuote, rest4] = splitAts [4,5,210] rest2
-            if BSLC.unpack keyVal == key
-            then Just (packetToQuote packetTime packetQuote, rest4)
-            else nextQuote key $ BSLC.drop packetLength rest
-        else nextQuote key $ BSLC.drop packetLength rest
-    else Nothing
+nextQuote :: BSLC.ByteString -> ReaderT Config IO (Maybe (Quote, BSLC.ByteString))
+nextQuote stream = if not (BSLC.null stream)
+    then do
+        cfg <- ask
+        -- extract pcap packet header
+        let [bsPacketTimeSec, bsPacketTimeUSec, _, bsPacketLen, rest] = splitAts [4,4,4,4] stream
+        let [packetTimeSec, packetTimeUSec, packetLen] = map (myDecodeInt . BSLC.reverse) [bsPacketTimeSec, bsPacketTimeUSec, bsPacketLen]
+        -- extract ethernet header, IPv4 header, UDP header
+        let [_, bsDestPort, rest2] = splitAts[36,2] rest
+        if myDecodeInt bsDestPort `elem` [15515, 15516]
+        then do
+            let [_, keyVal, packetQuote, rest3] = splitAts [4,5,210] rest2
+            if BSLC.unpack keyVal == key cfg
+            then return $ Just (packetToQuote (show (packetTimeSec * 1000000 + packetTimeUSec)) packetQuote, rest3)
+            else nextQuote $ BSLC.drop ((fromIntegral packetLen::Int64)) rest
+        else nextQuote $ BSLC.drop ((fromIntegral packetLen::Int64)) rest
+    else return Nothing
 
 -- transfers quotes from queue to reorder buffer, while printing from reorder buffer.
 -- Then printing quotes remaining in reorder buffer.
@@ -362,17 +381,6 @@ printOlderThan reorderBuf newAcceptTime = do
                 printOlderThan poppedBuf newAcceptTime
             else return reorderBuf
 
-{- Leading pad with zeros. 
-    `n` is the target length.
-    If `s` matches or exceeds target length, return `s` as-is.
--}
-padWithZeros :: Int -> String -> String
-{-# INLINE padWithZeros #-}
-padWithZeros n s
-    | len >= n = s
-    | otherwise = replicate (n - len) '0' ++ s
-    where len = length s
-
 {- Accept packet time and the 210 bytes after B6034 and turn them into a quote -}
 packetToQuote :: String -> BSLC.ByteString -> Quote
 {-# INLINE packetToQuote #-}
@@ -394,7 +402,7 @@ packetToQuote packetTime bs = Quote
         items = map BSLC.unpack $ init $ splitAts [12,12, 5,7,5,7,5,7,5,7,5,7, 7, 5,7,5,7,5,7,5,7,5,7, 50, 8, 1] bs
 
 -- plural version of splitAt
--- If xs runs out early, copies of remaining xs will be returned.
+-- If xs runs out early, copies of remaining xs will be returned.  !!!!!!???
 splitAts :: [Int] -> BSLC.ByteString  -> [BSLC.ByteString]
 splitAts [] xs = [xs]
 splitAts (n:ns) xs = taken:(splitAts ns dropped)

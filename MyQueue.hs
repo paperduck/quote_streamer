@@ -1,3 +1,5 @@
+-- Queue wrapper around Data.Sequence
+
 module MyQueue
 ( MyQueue
 , empty
