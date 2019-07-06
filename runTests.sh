@@ -1,0 +1,1 @@
+runhaskell Tests.hs

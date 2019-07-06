@@ -2,7 +2,7 @@
 -- see http://haskell.org/cabal/users-guide/
 
 name:                cs
-version:             0.1.0.0
+version:             0.2.0.0
 -- synopsis:            
 -- description:         
 homepage:            x
@@ -22,16 +22,20 @@ library
 
 executable cs
   main-is:             Main.hs
-  -- other-modules:       
+  other-modules:       Model
+                       ,MyQueue
+                       ,Utility
+                       ,View
   -- other-extensions:    
   build-depends:    base >=4.9 && <4.10
                     ,ansi-terminal == 0.9
                     ,bytestring
                     ,containers == 0.6.0.1
                     ,heap
-                    ,network-transport == 0.5.4
                     ,mtl == 2.2.1
+                    ,network-transport == 0.5.4
                     ,queue == 0.1.2
+                    ,timeit == 2.0
   -- hs-source-dirs:      
   default-language:    Haskell2010
   other-languages:     Haskell98

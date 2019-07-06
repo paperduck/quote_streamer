@@ -1,12 +1,13 @@
 -- Queue wrapper around Data.Sequence
 
 module MyQueue
-( MyQueue
-, empty
-, push
-, pop
-, size
-, MyQueue.null
+(MyQueue
+,empty
+,push
+,pop
+,peek
+,size
+,MyQueue.null
 ) where
 
 import qualified Data.Sequence as S
