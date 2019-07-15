@@ -36,6 +36,6 @@ executable cs
                     ,network-transport == 0.5.4
                     ,queue == 0.1.2
                     ,timeit == 2.0
-  -- hs-source-dirs:      
+  hs-source-dirs:      src
   default-language:    Haskell2010
   other-languages:     Haskell98

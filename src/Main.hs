@@ -1,6 +1,4 @@
-module MyLib 
-(appMain
-) where
+module Main where
 
 -- Dependencies
 import           Control.Concurrent         (forkIO)
@@ -25,10 +23,10 @@ import           Utility                    (splitAts, myDecodeInt16
 import           View                       (logMsg, printQuote, showErrors)
 
 -- main
-appMain :: IO ()
-appMain = timeIt $ do
+main :: IO ()
+main = do
     -- Gather command line options
-    (optArgs, nonOpts, unrecOpts, cmdErrs)  <- liftM (getOpt' Permute options) getArgs
+    (optArgs, nonOpts, unrecOpts, cmdErrs) <- liftM (getOpt' Permute options) getArgs
 
     -- Environment configuration settings
     emptyDrawer                 <- newEmptyMVar 
@@ -38,9 +36,9 @@ appMain = timeIt $ do
     let config      = Config {
         filename            ="mdf-kospi200.20110216-0.pcap"
         ,verbose            =(Verbose `elem` optArgs)
-        ,sortDelay          =300      -- accept time threshold in 1/100 seconds 
-        ,quoteType          ="B6034"  -- target  Data Type + Information Type + Market Type
-        ,ports              =[15515, 15516]
+        ,sortDelay          =300  -- accept time threshold, 1/100 seconds
+        ,quoteType          ="B6034"  -- target quote type
+        ,ports              =[15515, 15516]  -- target ports
         ,reorder            =(Reorder `elem` optArgs)
         ,ticker             =(Ticker `elem` optArgs)
         ,skip               =(Skip `elem` optArgs)
@@ -84,11 +82,13 @@ appMain = timeIt $ do
                 if skip config then do
                     -- Launch a printer thread before the stream starts
                     if buffer config then
-                        if reorder config then forkIO $ runReaderT (printerBufferReorder Q.empty Heap.empty) config
-                        else                   forkIO $ runReaderT (printerBuffer        Q.empty)            config
+                        if reorder config 
+                        then forkIO $ runReaderT (printerBufferReorder Q.empty Heap.empty) config
+                        else forkIO $ runReaderT (printerBuffer        Q.empty)            config
                     else
-                        if reorder config then forkIO $ runReaderT (printerReorder               Heap.empty) config
-                        else                   forkIO $ runReaderT (printer                                ) config
+                        if reorder config
+                        then forkIO $ runReaderT (printerReorder               Heap.empty) config
+                        else forkIO $ runReaderT (printer                                ) config
                     -- Start stream
                     runReaderT (listenThreaded stream) config
                 else
@@ -120,19 +120,24 @@ getBufferSize flags = case sizes of
 options :: [OptDescr Flag]
 {-# INLINE options #-}
 options = [ 
-     Option ['v'] ["verbose"] (NoArg Verbose)   "Verbose output"
-    ,Option ['h'] ["help"]    (NoArg Help)      "Show help"
-    ,Option ['r'] ["reorder"] (NoArg Reorder)   "Reorder by quote accept time"
-    ,Option ['t'] ["ticker"]  (NoArg Ticker)    "Each quote overwrites the previous one"
-    ,Option ['s'] ["skip-channel"] (NoArg Skip) "Skip quotes to eliminate printing bottleneck."
-    ,Option ['b'] ["buffer"]  (ReqArg (\s -> Buffer (read s::Int)) "BUFSIZE")
-        "Buffer up to n quotes to be printed. Not as useful as it seems."
+     Option ['v'] ["verbose"] (NoArg Verbose)
+        "Verbose output"
+    ,Option ['h'] ["help"]    (NoArg Help)  
+        "Show help"
+    ,Option ['r'] ["reorder"] (NoArg Reorder) 
+        "Reorder by quote accept time"
+    ,Option ['t'] ["ticker"]  (NoArg Ticker)    
+        "Each quote overwrites the previous one"
+    ,Option ['s'] ["skip-channel"] (NoArg Skip) 
+        "Skip quotes to eliminate printing bottleneck."
+    ,Option ['b'] ["buffer"]  (ReqArg (\s -> Buffer (read s::Int)) "BUFSIZE") $
+        "Buffer up to BUFSIZE quotes to be printed. " 
+        ++ "Implemented mainly as an exercise. Not as useful as it seems."
     ]
 
 -- Take a quote from the stream and print it
 listen :: BSLC.ByteString -> ReaderT Config IO ()
 listen stream = do
-    cfg <- ask
     mq <- nextQuote stream
     case mq of
         Just (newQuote, streamRest) -> do
@@ -143,7 +148,6 @@ listen stream = do
 -- Take a quote from the stream and reorder it
 listenReorder :: BSLC.ByteString -> Heap.MinHeap Quote -> ReaderT Config IO ()
 listenReorder stream reorderBuffer = do
-    cfg <- ask
     mq <- nextQuote stream
     case mq of
         Just (newQuote, streamRest) -> do
@@ -169,7 +173,7 @@ printer = do
     mNewQuote <- liftIO . takeMVar $ drawer cfg
     case mNewQuote of
         Nothing -> do
-            logMsg "\nstream appears to have ended"
+            logMsg "\nstream appears to have ended."
             liftIO $ putMVar (finishedPrinting cfg) True
         Just newQuote -> printQuote newQuote >> printer
 
@@ -195,7 +199,9 @@ printerBuffer queue = do
                         then do  -- Buffer full; skip new quote
                             let (poppedQueue, mQuote) = Q.pop queue
                             case mQuote of
-                                Just quote -> printQuote quote >> printerBuffer poppedQueue
+                                Just quote -> do
+                                    printQuote quote
+                                    printerBuffer poppedQueue
                                 Nothing -> error "printerBuffer: full queue has no items"
                         -- Quickly add to buffer without printing anything
                         else printerBuffer (Q.push newQuote queue)  
@@ -243,7 +249,8 @@ printerBufferReorder queue reorderBuffer = do
                             let (poppedQueue, mQuote) = Q.pop queue
                             case mQuote of
                                 Just quote ->  do  -- Insert to reorder buffer
-                                    newReorderBuffer <- printOlderThan reorderBuffer (acceptTime quote)
+                                    newReorderBuffer <- printOlderThan
+                                        reorderBuffer (acceptTime quote)
                                     printerBufferReorder poppedQueue newReorderBuffer
                                 Nothing -> error "printerBufferReorder: full queue has no items"
                         -- Quickly add to buffer without printing anything
@@ -253,36 +260,39 @@ printerBufferReorder queue reorderBuffer = do
                         flushAll queue reorderBuffer 
                         liftIO $ putMVar  (finishedPrinting cfg) True
 
--- RETURNS: The next quote from the UDP stream, or Nothing when
+-- RETURNS: The next quote from the stream, or Nothing when
 -- stream ends.
 nextQuote :: BSLC.ByteString -> ReaderT Config IO (Maybe (Quote, BSLC.ByteString))
 nextQuote stream = if not (BSLC.null stream)
     then do
         cfg <- ask
         -- Extract pcap packet header
-        let [bsPacketTimeSec, bsPacketTimeUSec, _, bsPacketLen, rest] = splitAts [4,4,4,4] stream
-        let [packetTimeSec, packetTimeUSec, packetLen] 
-                = map
-                    (myDecodeInt32 . BSLC.reverse)
-                    [bsPacketTimeSec, bsPacketTimeUSec, bsPacketLen]
-        -- Extract ethernet header, IPv4 header, UDP header
-        let [_, bsDestPort, rest2] = splitAts[36,2] rest
-        if myDecodeInt16 bsDestPort `elem` (ports cfg)  -- Filter by port
+        let [bsPacketTimeSec, bsPacketTimeUSec, _, bsPacketLen, rest] = splitAts 
+                [4,4,4,4] stream
+        let [packetTimeSec, packetTimeUSec, packetLen] = map
+                (myDecodeInt32 . BSLC.reverse)
+                [bsPacketTimeSec, bsPacketTimeUSec, bsPacketLen]
+        if packetLen == 257  -- filter by packet length
         then do
-            let [_, quoteTypeVal, packetQuote, rest3] = splitAts [4,5,210] rest2
-            if BSLC.unpack quoteTypeVal == (quoteType cfg)  -- Filter by quote type
-            then return $ Just
-                ( packetToQuote (packetTimeSec * 1000000 + packetTimeUSec) packetQuote 
-                , rest3 )
-            else nextQuote $ BSLC.drop ((fromIntegral packetLen::Int64)) rest
-        else     nextQuote $ BSLC.drop ((fromIntegral packetLen::Int64)) rest
+            -- Extract ethernet header, IPv4 header, UDP header
+            let [_, bsDestPort, rest2] = splitAts[36,2] rest
+            if myDecodeInt16 bsDestPort `elem` (ports cfg)  -- Filter by port
+            then do
+                let [_, bsType, bsQuote, rest3] = splitAts [4,5,210] rest2
+                if BSLC.unpack bsType == quoteType cfg -- Filter by quote type
+                then return $ Just
+                    ( packetToQuote (packetTimeSec * 1000000 + packetTimeUSec) bsQuote 
+                    , rest3 )
+                else nextQuote $ BSLC.drop ((fromIntegral packetLen::Int64)) rest
+            else     nextQuote $ BSLC.drop ((fromIntegral packetLen::Int64)) rest
+        else         nextQuote $ BSLC.drop ((fromIntegral packetLen::Int64)) rest
     else return Nothing
 
--- Transfers quotes from queue to reorder buffer, while printing from reorder buffer.
--- Then printing quotes remaining in reorder buffer.
+-- Transfers quotes from queue to reorder buffer, 
+--  while printing from reorder buffer.
+-- Then flushes the reorder buffer.
 flushAll :: Q.MyQueue Quote -> Heap.MinHeap Quote -> ReaderT Config IO ()
 flushAll q rb = do
-    cfg <- ask
     let (poppedQueue, mQuote) = Q.pop q
     case mQuote of
         -- Insert popped quote into reorder buffer
@@ -292,7 +302,6 @@ flushAll q rb = do
 -- Print quotes remaining in buffer
 flushBuffer :: Q.MyQueue Quote -> ReaderT Config IO ()
 flushBuffer queue = do
-    cfg <- ask
     let (poppedBuf, mQuote) = Q.pop queue
     case mQuote of
         Just q -> printQuote q >> flushBuffer poppedBuf
@@ -301,7 +310,6 @@ flushBuffer queue = do
 -- Print remaining reordered quotes 
 flushReordered :: Heap.MinHeap Quote -> ReaderT Config IO ()
 flushReordered buf = do
-    cfg <- ask
     case Heap.view buf of
         Just (oldestQuote, poppedBuf) -> do
             printQuote oldestQuote
@@ -339,4 +347,5 @@ packetToQuote packetTime bs = Quote
     (items!!22 ++ "@" ++ items!!21) -- ask 5
     (read (items!!24)::Int)         -- accept time
     where
-        items = map BSLC.unpack $ init $ splitAts [12,12, 5,7,5,7,5,7,5,7,5,7, 7, 5,7,5,7,5,7,5,7,5,7, 50, 8, 1] bs
+        items = map BSLC.unpack $ init $ splitAts 
+            [12,12, 5,7,5,7,5,7,5,7,5,7, 7, 5,7,5,7,5,7,5,7,5,7, 50, 8, 1] bs

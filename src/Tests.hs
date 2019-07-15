@@ -6,7 +6,6 @@ import           Control.Exception (evaluate)
 import qualified Data.ByteString.Lazy.Char8 as BSLC
 import           Test.Hspec
 --
-import           MyLib as Lib
 import           Utility
 import           MyQueue as Q
 
